@@ -1,208 +1,108 @@
-const http = require('node:http');
-const { URL } = require('node:url');
+const API_BASE = window.KASFLOW_API_BASE || 'http://localhost:3000/api';
 
-const PORT = Number(process.env.PORT || 3000);
-const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const demoShift = { id: 'demo-shift', status: 'aktif', modal_awal: 1500000, mulai_pada: new Date().toISOString(), petugas: { nama: 'Sari Utami' } };
+const demoSales = [
+  { id: '1', terjadi_pada: new Date(Date.now() - 12 * 60000).toISOString(), jenis_bbm: 'Pertamax', volume_liter: 32, total: 448000, metode_pembayaran: 'QRIS' },
+  { id: '2', terjadi_pada: new Date(Date.now() - 37 * 60000).toISOString(), jenis_bbm: 'Pertalite', volume_liter: 20, total: 200000, metode_pembayaran: 'Tunai' },
+  { id: '3', terjadi_pada: new Date(Date.now() - 71 * 60000).toISOString(), jenis_bbm: 'Solar', volume_liter: 45, total: 337500, metode_pembayaran: 'Kartu Debit' }
+];
+const demoCash = [{ id: 'c1', terjadi_pada: new Date(Date.now() - 25 * 60000).toISOString(), jenis: 'keluar', kategori: 'Pembelian ATK', nominal: 75000 }];
+let state = { shifts: [demoShift], sales: demoSales, cash: demoCash, demo: false };
 
-const headers = {
-  'Content-Type': 'application/json; charset=utf-8',
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+const money = (value) => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(Number(value || 0));
+const parseLocalizedNumber = (value) => {
+  const text = String(value ?? '').trim().replace(/\s/g, '');
+  if (!text) return NaN;
+  const comma = text.lastIndexOf(',');
+  const dot = text.lastIndexOf('.');
+  if (comma !== -1 && dot !== -1) return comma > dot ? Number(text.replace(/\./g, '').replace(',', '.')) : Number(text.replace(/,/g, ''));
+  if (comma !== -1) return Number(text.replace(',', '.'));
+  if ((text.match(/\./g) || []).length > 1 || (dot !== -1 && text.length - dot - 1 === 3)) return Number(text.replace(/\./g, ''));
+  return Number(text);
 };
+const dateTime = (value) => new Intl.DateTimeFormat('id-ID', { hour: '2-digit', minute: '2-digit' }).format(new Date(value));
+const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;' }[char]));
 
-function sendJson(response, status, payload) {
-  response.writeHead(status, headers);
-  response.end(JSON.stringify(payload));
-}
-
-function parseBody(request) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    request.on('data', (chunk) => {
-      body += chunk;
-      if (body.length > 1_000_000) reject(new Error('Payload terlalu besar'));
-    });
-    request.on('end', () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch {
-        reject(new Error('Format JSON tidak valid'));
-      }
-    });
-    request.on('error', reject);
-  });
-}
-
-function assertSupabaseConfigured() {
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error('SUPABASE_URL dan SUPABASE_SERVICE_ROLE_KEY belum dikonfigurasi');
-  }
-}
-
-async function supabaseRequest(path, options = {}) {
-  assertSupabaseConfigured();
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      Prefer: options.method === 'POST' ? 'return=representation' : 'count=exact',
-      ...(options.headers || {})
-    }
-  });
-
-  const text = await response.text();
-  let data;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = { message: text };
-  }
-  if (!response.ok) {
-    const error = new Error(data?.message || 'Supabase request gagal');
-    error.status = response.status;
-    throw error;
-  }
+async function request(path, options) {
+  const response = await fetch(`${API_BASE}${path}`, options);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.message || 'Request gagal');
   return data;
 }
 
-function limitFrom(url) {
-  const value = Number(url.searchParams.get('limit') || 8);
-  return Math.min(Math.max(value, 1), 50);
+function activeShift() { return state.shifts.find((shift) => shift.status === 'aktif') || state.shifts[0]; }
+function refreshShiftOptions() {
+  const options = state.shifts.filter((shift) => shift.status === 'aktif').map((shift) => `<option value="${shift.id}">${escapeHtml(shift.petugas?.nama || 'Petugas')} - ${dateTime(shift.mulai_pada)}</option>`).join('');
+  document.querySelectorAll('#saleShift, #cashShift').forEach((select) => { select.innerHTML = options || '<option value="">Belum ada shift aktif</option>'; });
 }
-
-function parseLocalizedNumber(value) {
-  if (typeof value === 'number') return value;
-  const text = String(value ?? '').trim().replace(/\s/g, '');
-  if (!text) return NaN;
-  const lastComma = text.lastIndexOf(',');
-  const lastDot = text.lastIndexOf('.');
-  if (lastComma !== -1 && lastDot !== -1) {
-    return lastComma > lastDot
-      ? Number(text.replace(/\./g, '').replace(',', '.'))
-      : Number(text.replace(/,/g, ''));
-  }
-  if (lastComma !== -1) return Number(text.replace(',', '.'));
-  if ((text.match(/\./g) || []).length > 1) return Number(text.replace(/\./g, ''));
-  if (lastDot !== -1 && text.length - lastDot - 1 === 3) return Number(text.replace('.', ''));
-  return Number(text);
-}
-
-async function dashboardData() {
-  const [shifts, sales, cash] = await Promise.all([
-    supabaseRequest('shift?select=*,petugas(nama)&order=mulai_pada.desc&limit=8'),
-    supabaseRequest('penjualan_bbm?select=*,shift(petugas(nama))&order=terjadi_pada.desc&limit=8'),
-    supabaseRequest('transaksi_kas?select=*,shift(petugas(nama))&order=terjadi_pada.desc&limit=8')
-  ]);
-  const activeShift = shifts.find((shift) => shift.status === 'aktif') || null;
-  const today = new Date();
-  const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate()).toISOString();
-  const todaySales = sales.filter((sale) => sale.terjadi_pada >= startOfDay);
-  const todayCash = cash.filter((item) => item.terjadi_pada >= startOfDay);
+function render() {
+  const shift = activeShift();
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const todaySales = state.sales.filter((sale) => new Date(sale.terjadi_pada) >= todayStart);
   const salesTotal = todaySales.reduce((sum, sale) => sum + Number(sale.total || 0), 0);
+  const cashIn = state.cash.filter((item) => item.jenis === 'masuk').reduce((sum, item) => sum + Number(item.nominal || 0), 0);
+  const cashOut = state.cash.filter((item) => item.jenis === 'keluar').reduce((sum, item) => sum + Number(item.nominal || 0), 0);
   const cashSalesTotal = todaySales.filter((sale) => sale.metode_pembayaran === 'Tunai').reduce((sum, sale) => sum + Number(sale.total || 0), 0);
-  const cashIn = todayCash.filter((item) => item.jenis === 'masuk').reduce((sum, item) => sum + Number(item.nominal || 0), 0);
-  const cashOut = todayCash.filter((item) => item.jenis === 'keluar').reduce((sum, item) => sum + Number(item.nominal || 0), 0);
-
-  return {
-    summary: {
-      salesToday: salesTotal,
-      cashBalance: Number(activeShift?.modal_awal || 0) + cashSalesTotal + cashIn - cashOut,
-      transactionCount: todaySales.length,
-      activeShift
-    },
-    shifts,
-    sales,
-    cash
-  };
+  document.querySelector('#salesToday').textContent = money(salesTotal);
+  document.querySelector('#cashBalance').textContent = money(Number(shift?.modal_awal || 0) + cashSalesTotal + cashIn - cashOut);
+  document.querySelector('#transactionCount').textContent = todaySales.length;
+  document.querySelector('#salesTrend').textContent = todaySales.length ? `${todaySales.length} transaksi masuk hari ini` : 'Belum ada transaksi';
+  document.querySelector('#shiftName').textContent = shift ? `${shift.petugas?.nama || 'Petugas'} / Shift aktif` : 'Belum ada shift aktif';
+  document.querySelector('#shiftMeta').textContent = shift ? `Dimulai ${dateTime(shift.mulai_pada)} - modal awal ${money(shift.modal_awal)}` : 'Buka shift untuk mulai mencatat transaksi.';
+  document.querySelector('#shiftStatus').textContent = shift ? 'Berjalan' : 'Belum aktif';
+  document.querySelector('#openShiftButton').hidden = Boolean(shift);
+  document.querySelector('#salesTable').innerHTML = state.sales.length ? state.sales.slice(0, 8).map((sale) => `<tr><td>${dateTime(sale.terjadi_pada)}</td><td><strong>${escapeHtml(sale.jenis_bbm)}</strong></td><td>${Number(sale.volume_liter).toLocaleString('id-ID')} L</td><td>${escapeHtml(sale.metode_pembayaran)}</td><td class="align-right"><strong>${money(sale.total)}</strong></td></tr>`).join('') : '<tr><td colspan="5" class="empty-state">Belum ada penjualan.</td></tr>';
+  const activities = [...state.sales.map((sale) => ({ ...sale, label: `Penjualan ${sale.jenis_bbm}`, detail: money(sale.total), green: true })), ...state.cash.map((item) => ({ ...item, label: `${item.jenis === 'masuk' ? 'Kas masuk' : 'Kas keluar'} - ${item.kategori}`, detail: money(item.nominal) }))].sort((a, b) => new Date(b.terjadi_pada) - new Date(a.terjadi_pada)).slice(0, 5);
+  document.querySelector('#activityList').innerHTML = activities.length ? activities.map((item) => `<div class="activity-item"><span class="activity-marker ${item.green ? 'green' : ''}"></span><div class="activity-copy"><strong>${escapeHtml(item.label)}</strong><span>${dateTime(item.terjadi_pada)} &middot; ${item.detail}</span></div></div>`).join('') : '<div class="empty-state">Belum ada aktivitas.</div>';
+  refreshShiftOptions();
 }
+function showToast(message) { const toast = document.querySelector('#toast'); toast.textContent = message; toast.classList.add('show'); setTimeout(() => toast.classList.remove('show'), 3000); }
+function setConnection(isOnline) { const status = document.querySelector('#connectionStatus'); status.classList.toggle('online', isOnline); status.innerHTML = `<i></i>${isOnline ? 'Supabase tersambung' : 'Mode demo lokal'}`; document.querySelector('#apiNote').textContent = isOnline ? 'Terhubung ke Supabase melalui API' : 'Frontend siap, API belum dikonfigurasi'; }
 
-function validateSale(payload) {
-  const required = ['shift_id', 'jenis_bbm', 'volume_liter', 'harga_per_liter', 'metode_pembayaran'];
-  if (required.some((key) => payload[key] === undefined || payload[key] === '')) throw new Error('Data penjualan belum lengkap');
-  const volume = parseLocalizedNumber(payload.volume_liter);
-  const price = parseLocalizedNumber(payload.harga_per_liter);
-  if (!Number.isFinite(volume) || !Number.isFinite(price) || volume <= 0 || price <= 0) throw new Error('Volume dan harga harus berupa angka yang valid');
-  return { volume, price };
-}
-
-function validateCash(payload) {
-  const required = ['shift_id', 'jenis', 'kategori', 'nominal'];
-  if (required.some((key) => payload[key] === undefined || payload[key] === '')) throw new Error('Data transaksi kas belum lengkap');
-  const nominal = parseLocalizedNumber(payload.nominal);
-  if (!Number.isFinite(nominal) || nominal <= 0) throw new Error('Nominal harus berupa angka yang valid');
-  return nominal;
-}
-
-async function openShift(payload) {
-  const nama = String(payload.nama_petugas || 'Sari Utami').trim();
-  const modalAwal = parseLocalizedNumber(payload.modal_awal || 0);
-  if (!nama || !Number.isFinite(modalAwal) || modalAwal < 0) throw new Error('Nama petugas dan modal awal harus valid');
-
-  const existing = await supabaseRequest(`petugas?nama=eq.${encodeURIComponent(nama)}&select=id&limit=1`);
-  let petugas = existing?.[0];
-  if (!petugas) {
-    const created = await supabaseRequest('petugas', { method: 'POST', body: JSON.stringify({ nama, peran: 'operator' }) });
-    petugas = created?.[0];
-  }
-  const shifts = await supabaseRequest('shift?status=eq.aktif&select=id&limit=1');
-  if (shifts?.length) throw new Error('Masih ada shift aktif. Tutup shift tersebut sebelum membuka shift baru.');
-  const createdShift = await supabaseRequest('shift', { method: 'POST', body: JSON.stringify({ petugas_id: petugas.id, modal_awal: modalAwal, status: 'aktif' }) });
-  return createdShift?.[0] || createdShift;
-}
-
-async function handle(request, response) {
-  if (request.method === 'OPTIONS') return sendJson(response, 204, {});
-  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
-
+async function loadDashboard() {
   try {
-    if (request.method === 'GET' && url.pathname === '/api/health') return sendJson(response, 200, { ok: true, configured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) });
-    if (request.method === 'GET' && url.pathname === '/api/dashboard') return sendJson(response, 200, await dashboardData());
-    if (request.method === 'GET' && url.pathname === '/api/shifts') return sendJson(response, 200, await supabaseRequest(`shift?select=*,petugas(nama)&order=mulai_pada.desc&limit=${limitFrom(url)}`));
-    if (request.method === 'GET' && url.pathname === '/api/sales') return sendJson(response, 200, await supabaseRequest(`penjualan_bbm?select=*,shift(petugas(nama))&order=terjadi_pada.desc&limit=${limitFrom(url)}`));
-    if (request.method === 'GET' && url.pathname === '/api/cash-transactions') return sendJson(response, 200, await supabaseRequest(`transaksi_kas?select=*,shift(petugas(nama))&order=terjadi_pada.desc&limit=${limitFrom(url)}`));
-
-    if (request.method === 'POST' && url.pathname === '/api/shifts/open') {
-      const payload = await parseBody(request);
-      return sendJson(response, 201, await openShift(payload));
-    }
-
-    if (request.method === 'POST' && url.pathname === '/api/sales') {
-      const payload = await parseBody(request);
-      const { volume, price } = validateSale(payload);
-      const sale = await supabaseRequest('penjualan_bbm', { method: 'POST', body: JSON.stringify({
-        shift_id: payload.shift_id,
-        jenis_bbm: payload.jenis_bbm,
-        volume_liter: volume,
-        harga_per_liter: price,
-        metode_pembayaran: payload.metode_pembayaran
-      }) });
-      return sendJson(response, 201, sale?.[0] || sale);
-    }
-
-    if (request.method === 'POST' && url.pathname === '/api/cash-transactions') {
-      const payload = await parseBody(request);
-      const nominal = validateCash(payload);
-      const transaction = await supabaseRequest('transaksi_kas', { method: 'POST', body: JSON.stringify({
-        shift_id: payload.shift_id,
-        jenis: payload.jenis,
-        kategori: payload.kategori,
-        nominal,
-        catatan: payload.catatan || null
-      }) });
-      return sendJson(response, 201, transaction?.[0] || transaction);
-    }
-
-    return sendJson(response, 404, { message: 'Endpoint tidak ditemukan' });
+    const data = await request('/dashboard');
+    state = { ...state, ...data, demo: false };
+    setConnection(true);
   } catch (error) {
-    console.error(error);
-    return sendJson(response, error.status || 500, { message: error.message || 'Terjadi kesalahan server' });
+    state.demo = true;
+    setConnection(false);
+  }
+  render();
+}
+async function submitForm(event, endpoint, form) {
+  event.preventDefault();
+  const payload = Object.fromEntries(new FormData(form));
+  try {
+    const result = await request(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    showToast('Data berhasil disimpan.');
+    form.reset();
+    await loadDashboard();
+    return result;
+  } catch (error) {
+    if (!state.demo) { showToast(error.message); return; }
+    const item = { ...payload, id: `demo-${Date.now()}`, terjadi_pada: new Date().toISOString(), total: endpoint === '/sales' ? parseLocalizedNumber(payload.volume_liter) * parseLocalizedNumber(payload.harga_per_liter) : undefined, nominal: endpoint === '/cash-transactions' ? parseLocalizedNumber(payload.nominal) : undefined };
+    if (endpoint === '/sales') state.sales.unshift(item); else state.cash.unshift(item);
+    form.reset(); render(); showToast('Disimpan di mode demo browser.');
   }
 }
 
-http.createServer(handle).listen(PORT, () => {
-  console.log(`API Sistem Kas Pom Bensin berjalan di http://localhost:${PORT}`);
-});
+async function openShift() {
+  const namaPetugas = window.prompt('Nama petugas', 'Sari Utami');
+  if (!namaPetugas) return;
+  const modalAwal = window.prompt('Modal awal kas (boleh 1.500.000 atau 1500000)', '1500000');
+  if (modalAwal === null) return;
+  try {
+    await request('/shifts/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nama_petugas: namaPetugas, modal_awal: modalAwal }) });
+    showToast('Shift berhasil dibuka.');
+    await loadDashboard();
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+document.querySelector('#saleFormElement').addEventListener('submit', (event) => submitForm(event, '/sales', event.currentTarget));
+document.querySelector('#cashFormElement').addEventListener('submit', (event) => submitForm(event, '/cash-transactions', event.currentTarget));
+document.querySelector('#openShiftButton').addEventListener('click', openShift);
+document.querySelectorAll('[data-scroll-to]').forEach((button) => button.addEventListener('click', () => document.getElementById(button.dataset.scrollTo)?.scrollIntoView({ behavior: 'smooth' })));
+loadDashboard();
