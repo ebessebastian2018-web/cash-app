@@ -1,0 +1,1 @@
+window.KASFLOW_API_BASE = '';
